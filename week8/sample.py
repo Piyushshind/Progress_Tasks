@@ -1,102 +1,86 @@
-import os
-import time
+import io
+import librosa
+import numpy as np
+from scipy.signal import find_peaks
+import soundfile as sf
+import speech_recognition as sr
+import re
 import logging
-from flask import Blueprint, request, jsonify
-from werkzeug.utils import secure_filename
 
-from Services.video_service import process_video_stream
-from Services.audio_service import process_audio
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-logging.basicConfig(level=logging.INFO)
-
-face_controller = Blueprint('face_controller', __name__)
-
-UPLOAD_FOLDER = ".\Face_Service\\temp_files\\"
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-@face_controller.route('/receive-video', methods=['POST'])
-def receive_video():
+def decode_audio(audio_file):
+    """Decode the uploaded audio file and return the audio signal and sample rate."""
     try:
-        if 'file' not in request.files or 'image' not in request.files:
-            logging.error("Missing file or image part in the request")
-            return jsonify({"error": "File and image are required"}), 400
-        if 'audio' not in request.files or 'otp' not in request.form:
-            logging.error("Missing audio or otp part in the request")
-            return jsonify({"error": "audio and otp are required"}), 400
-
-        video_file = request.files['file']
-        image_file = request.files['image']
-        audio_file = request.files['audio']
-        number = request.form.get("otp")
-        
-        if video_file.filename == '' or image_file.filename == '':
-            logging.error("No file or image selected for upload")
-            return jsonify({"error": "Both video and image must be selected"}), 400
-        if audio_file.filename == '':
-            logging.error("No file or image selected for upload")
-            return jsonify({"error": "Both audio and otp must be selected"}), 400
-
-        audio_filename = secure_filename(audio_file.filename)  # Ensure filename is valid
-        audio_path = os.path.join(UPLOAD_FOLDER, audio_filename)
-
-        video_path = UPLOAD_FOLDER+ 'VideoRecorded.mp4'
-        image_path = UPLOAD_FOLDER+ 'actualImage.jpg'
-        # audio_path = UPLOAD_FOLDER, secure_filename(audio_file.filename)
-        video_file.save(video_path)
-        image_file.save(image_path)
-        audio_file.save(audio_path)
-
-        start_time = time.time()
-
-        video_result = process_video_stream(video_path=video_path, image_path=image_path,audio_path=audio_path,otp=number)
-
-        end_time = time.time()
-
-        # os.remove(video_path)
-        # os.remove(image_path)
-        # os.remove(audio_path)
-        
-        return jsonify({
-            "result": video_result,
-            "processing_time": end_time - start_time
-        }), 200
-
+        with open(audio_file,"rb") as audio_file:
+            audio_io = io.BytesIO(audio_file.read())
+        y, sample_rate = librosa.load(audio_io, sr=None)
+        return y, sample_rate
     except Exception as e:
-        logging.exception("Error processing video")
-        return jsonify({'error': str(e)}), 500
+        logging.error(f"Error decoding audio: {e}")
+        raise ValueError("Invalid audio file.")
 
-@face_controller.route('/receive-audio', methods=['POST'])
-def receive_audio():
+def check_liveliness(y, sample_rate):
+    """Check for liveliness by analyzing the audio's envelope and peak variations."""
     try:
-        if 'audio' not in request.files or 'otp' not in request.form:
-            logging.error("Missing audio or otp part in the request")
-            return jsonify({"error": "audio and otp are required"}), 400
-
-        audio_file = request.files['audio']
-
-        number = request.form.get("otp")
-
-        if audio_file.filename == '':
-            logging.error("No file or image selected for upload")
-            return jsonify({"error": "Both audio and otp must be selected"}), 400
-
-        audio_path = os.path.join(UPLOAD_FOLDER, secure_filename(audio_file.filename))
-        audio_file.save(audio_path)
-
-        start_time = time.time()
-
-        audio_result = process_audio(number=number,audio_path=audio_path)
-
-        end_time = time.time()
-
-        os.remove(audio_path)
-
-        return jsonify({
-            "result": audio_result,
-            "processing_time": end_time - start_time
-        }), 200
-
+        envelope = np.abs(librosa.onset.onset_strength(y=y, sr=sample_rate))
+        peaks, _ = find_peaks(envelope, height=0.1)
+        peak_count = len(peaks)
+        is_lively = peak_count > 10
+        return is_lively
     except Exception as e:
-        logging.exception("Error processing audio")
-        return jsonify({'error': str(e)}), 500
+        logging.error(f"Error checking liveliness: {e}")
+        raise ValueError("Liveliness check failed.")
+
+def verify_number(number, y, sample_rate):
+    """Verify if the spoken number is present in the audio."""
+    recognizer = sr.Recognizer()
+    recognized_text = ""
+    try:
+        with io.BytesIO() as audio_io:
+            sf.write(audio_io, y, sample_rate, format='WAV')
+            audio_io.seek(0)
+            with sr.AudioFile(audio_io) as source:
+                audio = recognizer.record(source)
+        
+        recognized_text = recognizer.recognize_google(audio)
+        recognized_number = "".join(re.findall(r'\d+', recognized_text))
+        logging.info(f"Recognized text: {recognized_number}")
+        
+        logging.info(f"Number in verify number: {number}")
+        is_verified = number == recognized_number
+        return is_verified, recognized_number
+    except sr.UnknownValueError:
+        logging.warning("Speech recognition could not understand the audio.")
+        return False, recognized_text
+    except sr.RequestError as e:
+        logging.error(f"Google Speech Recognition request failed: {e}")
+        return False, recognized_text
+    except Exception as e:
+        logging.error(f"Unexpected error during speech recognition: {e}")
+        raise ValueError("Speech recognition failed.")
+
+def process_audio(number, audio_file):
+    """Main function to process the audio and verify the number and liveliness."""
+    try:
+        logging.info("Starting audio processing.")
+        
+        y, sample_rate = decode_audio(audio_file)
+        
+        is_lively = check_liveliness(y, sample_rate)
+        
+        is_number_verified, recognized_text = verify_number(number, y, sample_rate)
+
+        result = {
+            "liveliness": is_lively,
+            "numberVerified": is_number_verified,
+            "transcribedOTP": recognized_text,
+            "actualOTP": number,
+            "audioDuration": librosa.get_duration(y=y, sr=sample_rate)
+        }
+        
+        logging.info("Audio processing completed successfully.")
+        return result
+    except Exception as e:
+        logging.error(f"Error during audio processing: {e}")
+        raise ValueError("Audio processing failed.")
